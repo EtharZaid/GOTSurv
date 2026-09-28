@@ -3,6 +3,10 @@
 """
 Multi-cancer GOTSurv post-analysis runner for paper plots.
 
+This runner keeps the bootstrap splitting and seed schedule from run_gotsurv_v1,
+but removes the extra downstream analysis blocks. For each cancer in
+CANCER_TYPES it trains the same GOTSurv/GOTFlow bootstrap workflow, saves the
+same core result CSVs, and only runs the selected post-analyses:
 
   1. choose_representative_run_indices
   2. plot_representative_quiver_runs_pca_z_and_pls_risk
@@ -42,12 +46,12 @@ import util_file as util
                                                                                
 
 SEED = 42
-                                             
-# You can choose a set of caner types to run, or just one for testing. The full set of cancer types is:
-# ["BLCA","BRCA","CESC", "COAD", "KIRC", "KIRP", "LIHC", "LUAD", "STAD", "UCEC"]                                                               
+
+                                                                  
+                                                                                      
 CANCER_TYPES = ["BRCA"]
 
-#Choose one of the following modalities: "Genes", "WSI"                    
+                                                               
 modality = "Genes"
 
 TIME_COL = "DSS.time"
@@ -57,7 +61,13 @@ MASTER_LOG_CSV = "Results/experiments_log_clustering_bootstrap.csv"
 EXP_DETAILS = "multi-cancer paper-only added prog analysis"
 
 RESULTS_DIR = "Results"
-PLOTS_DIR = "Plots"
+PAPER_PLOTS_DIR = "Plots/Paper_Plots"
+
+                                                             
+stage_23 = False
+DROP_ANOMALOUS_COAD = True
+MSI_SUBSET = None                                
+kras = False
 
                                                                           
 N_BOOTSTRAPS = 10
@@ -158,6 +168,7 @@ def pretrain_teacher_with_validation(
     e_tr: np.ndarray,
     params: dict,
     seed: int,
+    X_transductive: np.ndarray = None,
 ) -> GOTFlow:
     tr_idx, va_idx = train_val_split_indices(
         len(X_tr),
@@ -195,7 +206,7 @@ def pretrain_teacher_with_validation(
         X_val=X_val,
         time_val=t_val,
         event_val=e_val,
-        X_transductive=X_tr,
+        X_transductive=X_transductive if X_transductive is not None else X_tr,
         verbose=False,
     )
 
@@ -283,7 +294,7 @@ def _safe_json(x) -> str:
 
 def _plot_name(cancer_name: str, modality_name: str, proper_name: str,exp_num: str) -> str:
     proper = str(proper_name).strip().replace(" ", "_")
-    return str(Path(PLOTS_DIR) / f"{exp_num}_{cancer_name}_{modality_name}_{proper}.pdf")
+    return str(Path(PAPER_PLOTS_DIR) / f"{exp_num}_{cancer_name}_{modality_name}_{proper}.pdf")
 
 
 def load_filtered_dataset(cancer_name: str, modality_name: str):
@@ -295,11 +306,64 @@ def load_filtered_dataset(cancer_name: str, modality_name: str):
     )
 
     if cancer_name == "COAD":
-        #Anomolous samples that are known to be mislabeled or have other issues
-        df = df.drop(
+        if DROP_ANOMALOUS_COAD:
+            df = df.drop(
                 [x for x in ["TCGA-A6-2679", "TCGA-AA-A004"] if x in df.index],
                 axis=0,
             ).copy()
+
+        if stage_23:
+            stages = [
+                "Stage II", "Stage IIA", "Stage IIB", "Stage IIC",
+                "Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC",
+            ]
+            df_survival = pd.read_excel("./Datasets/TCGA-CDR-SupplementalTableS1.xlsx")
+            df_survival = df_survival.loc[
+                :,
+                ["bcr_patient_barcode", "ajcc_pathologic_tumor_stage"],
+            ]
+            df_survival.set_index("bcr_patient_barcode", inplace=True)
+            df_survival.index.set_names("SAMPLE_ID", inplace=True)
+            df = df.join(df_survival, on="SAMPLE_ID", how="inner")
+            df = df[df["ajcc_pathologic_tumor_stage"].isin(stages)]
+            df.drop(["ajcc_pathologic_tumor_stage"], axis=1, inplace=True)
+
+        if kras:
+            df_kras = pd.read_csv(COAD_CLINICAL_FILE)
+            df_kras = df_kras.loc[:, ["patient_id", "KRAS"]].set_index("patient_id")
+            df_kras.index.set_names("SAMPLE_ID", inplace=True)
+            df = df.join(df_kras, on="SAMPLE_ID", how="inner").replace({"KRAS": {"mut": 1, "wt": 0}})
+            df.dropna(subset=["KRAS"], inplace=True)
+
+        if MSI_SUBSET is not None:
+            msi_df = pd.read_csv(COAD_CLINICAL_FILE)
+            required_cols = {"patient_id", "MSI.status"}
+            missing_cols = required_cols - set(msi_df.columns)
+            if missing_cols:
+                raise ValueError(f"Missing required columns in MSI clinical file: {sorted(missing_cols)}")
+
+            msi_df["SAMPLE_ID"] = msi_df["patient_id"].astype(str).map(util._clean_tcga_sample_id)
+            msi_df["MSI.status"] = msi_df["MSI.status"].astype(str).str.strip().str.upper()
+
+            if MSI_SUBSET.upper() == "MSS":
+                keep_status = "MSS"
+            elif MSI_SUBSET.upper() == "MSI-H":
+                keep_status = "MSI-H"
+            else:
+                raise ValueError("MSI_SUBSET must be None, 'MSS', or 'MSI-H'.")
+
+            keep_ids = set(
+                msi_df.loc[
+                    msi_df["MSI.status"] == keep_status,
+                    "SAMPLE_ID",
+                ].dropna().astype(str)
+            )
+            n_before = df.shape[0]
+            df = df.loc[df.index.astype(str).isin(keep_ids)].copy()
+            print(f"[MSI filtering] {keep_status}: retained {df.shape[0]}/{n_before} patients.")
+
+            if df.empty:
+                raise ValueError(f"No samples remained after MSI filtering for {keep_status!r}.")
 
     return df, censoring
 
@@ -605,7 +669,7 @@ def run_one_cancer(cancer_name: str, modality_name: str) -> dict:
 
     set_seed(SEED)
     Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    Path(PLOTS_DIR).mkdir(parents=True, exist_ok=True)
+    Path(PAPER_PLOTS_DIR).mkdir(parents=True, exist_ok=True)
 
     df, censoring = load_filtered_dataset(cancer_name, modality_name)
     rmst_tau = float(np.nanquantile(df[TIME_COL].to_numpy(dtype=float), 0.90))
@@ -639,7 +703,7 @@ def run_one_cancer(cancer_name: str, modality_name: str) -> dict:
     got_runs = []
     risk_post_runs_for_quiver = []
     post_cindex_runs_for_quiver = []
-
+    x_all_runs_for_edge_heatmap = []
 
     for split in tqdm(bootstrap_info, desc=f"{dataset_name} bootstrap runs"):
         run_id = int(split["bootstrap"])
@@ -678,6 +742,7 @@ def run_one_cancer(cancer_name: str, modality_name: str) -> dict:
                 e_tr,
                 TEACHER_DEFAULT_PARAMS,
                 seed=teacher_seed,
+                X_transductive=X_all,
             )
         except Exception as e:
             print(f"[{dataset_name} bootstrap {run_id}] Teacher pretraining failed: {type(e).__name__}: {e}")
@@ -842,7 +907,7 @@ def run_one_cancer(cancer_name: str, modality_name: str) -> dict:
         got_runs.append(got)
         risk_post_runs_for_quiver.append(np.asarray(risk_post_all).reshape(-1))
         post_cindex_runs_for_quiver.append(float(post_c_te))
-
+        x_all_runs_for_edge_heatmap.append(X_all.copy())
 
         print(
             f"[{dataset_name} bootstrap {run_id}] "
@@ -1019,7 +1084,7 @@ def run_one_cancer(cancer_name: str, modality_name: str) -> dict:
         "oob_consensus_n_patients_covered": int(oob_coverage_n),
         "oob_consensus_coverage_fraction": float(oob_coverage_fraction),
         "include_terminal_analysis": bool(INCLUDE_TERMINAL_ANALYSIS),
-        "paper_plots_dir": PLOTS_DIR,
+        "paper_plots_dir": PAPER_PLOTS_DIR,
     }
 
     print("\n================ Bootstrap summary ================")
@@ -1126,20 +1191,20 @@ def run_one_cancer(cancer_name: str, modality_name: str) -> dict:
             arrow_color="blue",
             terminal_arrow_color="blue",
 
-            title_prefix=f"{dataset_name} GOTSurv quiver representative runs",
+            title_prefix=f"{dataset_name} GOTFlow quiver representative runs",
             colorbar_label="Post-OT predicted risk",
 
-            save_dir=PLOTS_DIR,
-            save_prefix=f"{exp_num}_{cancer_name}_{modality_name}_gotsurv_quiver_projection",
+            save_dir=PAPER_PLOTS_DIR,
+            save_prefix=f"{exp_num}_{cancer_name}_{modality_name}_gotflow_quiver_projection",
             show=False,
         )
         _record_plot(
-            "gotsurv_quiver_projection",
-            str(Path(PLOTS_DIR) / f"{exp_num}_{cancer_name}_{modality_name}_gotsurv_quiver_projection_<method>.pdf"),
+            "gotflow_quiver_projection",
+            str(Path(PAPER_PLOTS_DIR) / f"{exp_num}_{cancer_name}_{modality_name}_gotflow_quiver_projection_<method>.pdf"),
             "ok",
         )
     except Exception as e:
-        _record_plot("gotsurv_quiver_projection", None, "failed", f"{type(e).__name__}: {e}")
+        _record_plot("gotflow_quiver_projection", None, "failed", f"{type(e).__name__}: {e}")
         print(f"[{dataset_name}] Quiver plotting failed: {type(e).__name__}: {e}")
 
 
@@ -1238,57 +1303,40 @@ def run_one_cancer(cancer_name: str, modality_name: str) -> dict:
     else:
         _record_plot("cox_forest_heatmap_features", cox_save_path, "skipped", "heatmap_out unavailable")
 
-
-
-    sample_progression_save_path = _plot_name(
-        cancer_name,
-        modality_name,
-        "sample_level_progression",
-        exp_num,
-    )
-
+                           
+    edge_save_path = _plot_name(cancer_name, modality_name, "edge_shift_heatmap",exp_num)
     try:
-        _, sample_selection_df = util.plot_sample_level_progression(
-            cluster_assign_resid,
-            delta_prefix="mean_delta_",
-            state_col="state_mode",
-            mass_col="mean_transport_mass",
-            risk_label_col="risk_group",
-            id_col="SAMPLE_ID",
-            id_truncate=12,
-            top_genes=8,
-            quantiles=(0.10, 0.50, 0.90),
-            gene_mode="per_patient",
-            title=f"{dataset_name} sample-level progression profiles",
-            save_path=sample_progression_save_path,
-            show=False,
+        if "best" in set(rep_info["label"].astype(str)):
+            edge_run_idx = int(rep_info.loc[rep_info["label"].astype(str) == "best", "run_index"].iloc[0])
+        else:
+            edge_run_idx = int(np.nanargmax(np.asarray(post_cindex_runs_for_quiver, dtype=float)))
+
+        edge_state_ids = (
+            state_runs[edge_run_idx]
+            .set_index("SAMPLE_ID")
+            .reindex(df.index.astype(str))["state_id"]
+            .to_numpy()
         )
 
-        sample_selection_df.to_csv(
-            f"{result_prefix}_sample_level_selected_patients.csv",
-            index=False,
+        util.edge_shift_heatmap(
+            got_runs[edge_run_idx],
+            x_all_runs_for_edge_heatmap[edge_run_idx],
+            list(feature_cols),
+            edge_state_ids,
+            top_genes=15,
+            aggregate="mean",
+            signed=True,
+            weight_by_mass=True,
+            save_path=edge_save_path,
+            title=f"{dataset_name} per-edge feature shift",
         )
-
-        _record_plot(
-            "sample_level_progression",
-            sample_progression_save_path,
-            "ok",
-        )
-
+        _record_plot("edge_shift_heatmap", edge_save_path, "ok")
     except Exception as e:
-        _record_plot(
-            "sample_level_progression",
-            sample_progression_save_path,
-            "failed",
-            f"{type(e).__name__}: {e}",
-        )
-        print(
-            f"[{dataset_name}] Sample-level progression plot failed: "
-            f"{type(e).__name__}: {e}"
-        )                      
+        _record_plot("edge_shift_heatmap", edge_save_path, "failed", f"{type(e).__name__}: {e}")
+        print(f"[{dataset_name}] Edge-shift heatmap failed: {type(e).__name__}: {e}")
 
     post_plot_df = pd.DataFrame(post_plot_rows)
-    post_plot_df.to_csv(f"{result_prefix}_post_plot_status.csv", index=False)
+    post_plot_df.to_csv(f"{result_prefix}_paper_post_plot_status.csv", index=False)
 
     summary = {
         "cancer": cancer_name,
@@ -1318,7 +1366,7 @@ def main():
 
     set_seed(SEED)
     Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    Path(PLOTS_DIR).mkdir(parents=True, exist_ok=True)
+    Path(PAPER_PLOTS_DIR).mkdir(parents=True, exist_ok=True)
 
     all_summaries = []
 
@@ -1340,12 +1388,12 @@ def main():
         all_summaries.append(summary)
 
     summary_df = pd.DataFrame(all_summaries)
-    summary_path = Path(RESULTS_DIR) / "results_summary.csv"
+    summary_path = Path(RESULTS_DIR) / "paper_postanalysis_multi_cancer_summary.csv"
     summary_df.to_csv(summary_path, index=False)
 
     print("\nAll requested cancers finished.")
     print(f"Summary saved to: {summary_path}")
-    print(f"Plots saved to: {PLOTS_DIR}")
+    print(f"Paper plots saved to: {PAPER_PLOTS_DIR}")
 
 
 if __name__ == "__main__":
