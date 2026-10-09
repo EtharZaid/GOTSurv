@@ -1120,15 +1120,14 @@ class ClusterAwareSurvivalTeacher:
     def _cluster_weighted_pairwise_loss(self, risk: torch.Tensor, T: torch.Tensor, E: torch.Tensor, M: torch.Tensor, i_idx, j_idx):
         if i_idx.numel() == 0:
             return risk.new_tensor(0.0)
-                                                                                              
+        # For comparable pair j(event earlier) should have higher risk than i(longer survivor)
         margin = F.relu(1.0 - (risk[j_idx] - risk[i_idx]))
         Mi, Mj = M[i_idx], M[j_idx]
-                                                                                   
-        # Weight each comparable pair by the probability that the earlier-event
-        # sample j is assigned to the same or a higher-risk group than sample i:
-        # w_ij = sum_k sum_{ell >= k} m_ik m_jell.
-        suffix = torch.flip(torch.cumsum(torch.flip(M, (1,)), dim=1), (1,))
-        weights = (Mi * suffix[j_idx]).sum(dim=1)
+        # Give weight when earlier event is in same or higher-risk ordered cluster.
+        suffix = torch.flip(torch.cumsum(torch.flip(M, (1,)), dim=1), (1,)) - M
+        inter = (Mj * suffix[i_idx]).sum(dim=1)
+        intra = (Mi * Mj).sum(dim=1)
+        weights = inter + intra
         return (weights * margin).sum() / weights.sum().clamp_min(1e-12)
  
  
